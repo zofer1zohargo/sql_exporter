@@ -1,0 +1,283 @@
+# Override values for SQL Exporter deployment
+# Use with: helm install sql-exporter ./helm -f ~/sql-exporter-deployment/values-override.yaml
+
+# Image configuration
+image:
+  repository: burningalchemist/sql_exporter
+  tag: "0.19.1"
+
+# Logging configuration
+logLevel: debug
+
+# ServiceMonitor configuration for Prometheus Operator
+serviceMonitor:
+  interval: 30s
+  scrapeTimeout: 10s
+  selector:
+    monitored: dox-prometheus
+
+# Ingress configuration (if needed)
+# ingress:
+  # To enable TLS with Amdocs PKI certificate:
+  # tls:
+  #   enabled: true
+  #   secretName: sql-exporter-tls
+
+# Web config for TLS and Basic Auth
+webConfig:
+  enabled: true
+  tls:
+    secretName: sql-exporter-tls
+  basicAuth:
+    enabled: true
+    username: sqlexporter
+    initFromSecret:
+      enabled: true
+      secretName: sql-exporter-basic-auth
+      secretKey: password
+
+# Database configuration - uses dynamicConfig with unified secret
+createConfig: false
+dynamicConfig:
+  enabled: true
+  useApplicationName: true
+  secretName: unified-database-service-broker-secret
+  secretKey: APP_DB_CONNECTION
+  type: postgres
+  template: |
+    global:
+      scrape_timeout: 10s
+      scrape_timeout_offset: 500ms
+      scrape_error_drop_interval: 0s
+      min_interval: 0s
+      max_connections: 3
+      max_idle_connections: 3
+    target:
+      data_source_name: "__TYPE__://__DSN__"
+      collectors:
+        - amdocs_charging_ac_backlog
+        - amdocs_charging_ac_files
+        - amdocs_charging_ac_threads
+        - amdocs_charging_ers_rejected
+        - amdocs_charging_db2e
+        - amdocs_charging_db2e_events
+        - amdocs_charging_db2e_lag
+        - amdocs_charging_db2e_process_backlog
+        - amdocs_charging_file2e_backlog
+    collectors:
+      - collector_name: amdocs_charging_ac_backlog
+        min_interval: 1m
+        metrics:
+          - metric_name: amdocs_charging_ac_physical_files
+            type: gauge
+            help: Physical files count in last 60 minutes
+            values: [phyFile]
+            query: |
+              SELECT COUNT(1) AS "phyFile" 
+              FROM AC_PHYSICAL_FILES 
+              WHERE SYS_CREATION_DATE > NOW() - '60 MINUTES'::INTERVAL
+
+      - collector_name: amdocs_charging_ac_files
+        min_interval: 5m
+        metrics:
+          - metric_name: amdocs_charging_ac_file_backlog
+            type: gauge
+            help: AC file backlog by process and status
+            key_labels:
+              - process
+              - status
+            value_label: metric
+            values: [fileBacklog, recordBacklog, oldestRecordAge, oldestFile, newestFile]
+            query: |
+              WITH PGM_NAME AS (SELECT PROGRAM_NAME FROM AC_PROGRAMS)
+              SELECT NXT_PGM_NAME AS process, FILE_STATUS AS status, COUNT(1) AS "fileBacklog",
+                     SUM(WR_REC_QUANTITY) AS "recordBacklog",
+                     COALESCE(ROUND(EXTRACT(EPOCH FROM (NOW() - MIN(A.SYS_CREATION_DATE)))/60), 0) AS "oldestRecordAge",
+                     ROUND(EXTRACT(EPOCH FROM MIN(SYS_CREATION_DATE))) AS "oldestFile",
+                     ROUND(EXTRACT(EPOCH FROM MAX(SYS_CREATION_DATE))) AS "newestFile"
+              FROM AC1_CONTROL A, PGM_NAME PGM
+              WHERE NXT_PGM_NAME = PGM.PROGRAM_NAME
+              AND FILE_STATUS IN ('RD','IU','AF','WA','HO','AE')
+              GROUP BY NXT_PGM_NAME, FILE_STATUS
+
+      - collector_name: amdocs_charging_ac_threads
+        min_interval: 1m
+        metrics:
+          - metric_name: amdocs_charging_ac_thread_control
+            type: gauge
+            help: AC thread control status by type and member
+            key_labels:
+              - threadType
+              - memberID
+            value_label: metric
+            values: [threadsCnt, status]
+            query: |
+              SELECT THREAD_TYPE AS "threadType", MEMBER_ID as "memberID", 
+                     COUNT(MEMBER_ID) AS "threadsCnt", SUM(DOWN_CNT) AS status
+              FROM
+                  (SELECT THREAD_TYPE, OBJECT_NAME, MEMBER_ID, 
+                          (CASE WHEN THREAD_STATUS='DN' THEN 1 ELSE 0 END) AS DOWN_CNT
+                   FROM AC1_THR_CNTRL
+                   WHERE MEMBER_ID > 0) as subtable
+              GROUP BY THREAD_TYPE, MEMBER_ID
+
+      - collector_name: amdocs_charging_ers_rejected
+        min_interval: 1m
+        metrics:
+          - metric_name: amdocs_charging_ers_rejected_count
+            type: gauge
+            help: Rejected ERS count in last 30 minutes
+            values: [count]
+            query: |
+              SELECT COUNT(*) AS count
+              FROM APR1_REJECTED_ERS
+              WHERE SYS_CREATION_DATE > NOW() - '30 MINUTES'::INTERVAL
+
+      - collector_name: amdocs_charging_db2e
+        min_interval: 10m
+        metrics:
+          - metric_name: amdocs_charging_db2e_backlog
+            type: gauge
+            help: DB2E customer backlog per cycle
+            key_labels:
+              - cycleCode
+            value_label: metric
+            values: [customersBacklogPerCycle, oldestTrxAgeMin]
+            query: |
+              with CTRL_DATA as materialized (SELECT * FROM
+                                                (SELECT DISTINCT CTRL.CYCLE_CODE, CTRL.FROM_SEGMENT_ID, CTRL.TO_SEGMENT_ID,
+                                                        INCR_LAST_ORDER_ID, SEGMENTS_GROUP_ID, row_number()
+                                                 OVER (PARTITION BY SEGMENTS_GROUP_ID ORDER BY START_TIME desc ) AS ROWNUM
+                                                 FROM APR1_DB2E_CTRL CTRL
+                                                 WHERE CTRL.FULL_LAST_UPDATE_ID < 0
+                                                 AND CTRL.IS_SERVER_ACTIVE = 'Y'
+                                                 AND SERVER_ROLE >= 0) a
+                                              WHERE ROWNUM = 1 )
+              SELECT UNI.CYCLE_CODE AS "cycleCode", SUM(NUM_OF_EVENTS_WAITING) AS "customersBacklogPerCycle",
+                     MAX(OVERDUE_MINS) AS "oldestTrxAgeMin"
+              from (
+                    SELECT CTRL.CYCLE_CODE AS CYCLE_CODE, SUM (1) AS NUM_OF_EVENTS_WAITING,
+                           COALESCE(ROUND(EXTRACT(EPOCH FROM(NOW() - MIN(UPDATES.SYS_CREATION_DATE)))/60), 0) as OVERDUE_MINS
+                    FROM CTRL_DATA CTRL, AUH1_UPDATES UPDATES
+                    WHERE UPDATES.ORDER_ID > CTRL.INCR_LAST_ORDER_ID
+                    AND UPDATES.SEGMENTS_TYPE = 'C'
+                    AND CTRL.CYCLE_CODE = UPDATES.CYCLE_CODE
+                    AND CTRL.SEGMENTS_GROUP_ID = UPDATES.SEGMENTS_GROUP_ID
+                    GROUP BY CTRL.CYCLE_CODE
+                    UNION ALL
+                    SELECT CTRL.CYCLE_CODE AS CYCLE_CODE, SUM (1) AS NUM_OF_EVENTS_WAITING,
+                           COALESCE(ROUND(EXTRACT(EPOCH FROM (NOW() - MIN(UPDATES.SYS_CREATION_DATE)))/60), 0) as OVERDUE_MINS
+                    FROM CTRL_DATA CTRL, AUH1_UPDATES UPDATES
+                    WHERE UPDATES.ORDER_ID = 0
+                    AND UPDATES.SEGMENTS_TYPE = 'C'
+                    AND CTRL.CYCLE_CODE = UPDATES.CYCLE_CODE
+                    AND CTRL.SEGMENTS_GROUP_ID = UPDATES.SEGMENTS_GROUP_ID
+                    GROUP BY CTRL.CYCLE_CODE) UNI
+                    GROUP BY UNI.CYCLE_CODE
+
+      - collector_name: amdocs_charging_db2e_events
+        min_interval: 5m
+        metrics:
+          - metric_name: amdocs_charging_db2e_events
+            type: gauge
+            help: DB2E events resends, rejected, expired
+            key_labels:
+              - targetES
+              - db2eHost
+              - processGroupCode
+              - segType
+            value_label: metric
+            values: [resends, rejected, expired]
+            query: |
+              SELECT SUM(NUM_OF_RESENDS) AS resends, SUM(NUM_OF_REJ_EVENTS) AS rejected, 
+                     SUM(NUM_OF_EXPIRED_EVENTS) AS expired,
+                     TARGET_SERVER_ID AS "targetES", HOST AS "db2eHost", 
+                     PROCESS_GROUP_CODE AS "processGroupCode",
+                     CASE
+                         WHEN SEGMENTS_TYPE = 'C' THEN 'Customer'
+                         WHEN SEGMENTS_TYPE = 'R' THEN 'Resource'
+                         ELSE 'Other'
+                     END AS "segType"
+              FROM APR1_DB2E_ERR ERR, GN1_SYS_PROC_INST_GRP_CFG GRP
+              WHERE TARGET_SERVER_ID = PROCESS_GROUP_ID
+              AND DELETE_IND <> 'Y'
+              AND ERR.SYS_CREATION_DATE > NOW() - '10 MINUTES'::INTERVAL
+              GROUP BY TARGET_SERVER_ID, HOST, PROCESS_GROUP_CODE, "segType"
+
+      - collector_name: amdocs_charging_db2e_lag
+        min_interval: 5m
+        metrics:
+          - metric_name: amdocs_charging_db2e_performance_lag
+            type: gauge
+            help: DB2E performance lag by cycle
+            key_labels:
+              - cycleCode
+              - lagTime
+            value_label: metric
+            values: [lagSec, records]
+            query: |
+              SELECT CYCLE_CODE AS "cycleCode",
+                     COALESCE(TO_CHAR(TRUNC((EXTRACT(EPOCH FROM NOW()) - EXTRACT(EPOCH FROM SYS_CREATION_DATE))/(3600)),'0000') || ':' ||
+                              TO_CHAR(EXTRACT(MINUTES FROM AGE(NOW(), SYS_CREATION_DATE)),'00') || ':' ||
+                              TO_CHAR(TRUNC(EXTRACT(SECONDS FROM AGE(NOW(), SYS_CREATION_DATE))),'00'), '00:00:00') as "lagTime",
+                     COALESCE(TRUNC(EXTRACT(EPOCH FROM NOW()) - EXTRACT(EPOCH FROM SYS_CREATION_DATE)),0) AS "lagSec",
+                     COALESCE(SUM(NUM_OF_RECORDS),0) AS records
+              FROM AUH1_UPDATES
+              WHERE DAY_IN_MONTH IN ((TO_CHAR(CURRENT_DATE, 'DD')::INTEGER), (TO_CHAR(CURRENT_DATE -interval '1 day', 'DD')::INTEGER))
+              AND ORDER_ID = 0 and SEGMENTS_TYPE in ('C', 'R')
+              GROUP BY CYCLE_CODE,
+                    TO_CHAR(TRUNC((EXTRACT(EPOCH FROM NOW()) - EXTRACT(EPOCH FROM SYS_CREATION_DATE))/(3600)),'0000') || ':' ||
+                        TO_CHAR(EXTRACT(MINUTES FROM AGE(NOW(), SYS_CREATION_DATE)),'00') || ':' ||
+                        TO_CHAR(TRUNC(EXTRACT(SECONDS FROM AGE(NOW(), SYS_CREATION_DATE))),'00'),
+                    COALESCE(TRUNC(EXTRACT(EPOCH FROM NOW()) - EXTRACT(EPOCH FROM SYS_CREATION_DATE)),0)
+
+      - collector_name: amdocs_charging_db2e_process_backlog
+        min_interval: 1m
+        metrics:
+          - metric_name: amdocs_charging_db2e_process_db_backlog
+            type: gauge
+            help: DB2E process DB backlog - incremental and full mode
+            value_label: metric
+            values: [incrementalCnt, fullCnt]
+            query: |
+              SELECT INC_COUNT AS "incrementalCnt", FULL_COUNT AS "fullCnt"
+              FROM
+                (SELECT COUNT(*) AS INC_COUNT from APR1_DB2E_CTRL WHERE CURRENT_MODE='I' AND SYS_UPDATE_DATE > NOW() - '15 MINUTES'::INTERVAL) AS T1,
+                (SELECT COUNT(*) AS FULL_COUNT from APR1_DB2E_CTRL WHERE CURRENT_MODE='F' AND SYS_UPDATE_DATE > NOW() - '15 MINUTES'::INTERVAL) AS T2
+
+      - collector_name: amdocs_charging_file2e_backlog
+        min_interval: 1m
+        metrics:
+          - metric_name: amdocs_charging_file2e_performance_backlog
+            type: gauge
+            help: File2E performance backlog by file format
+            key_labels:
+              - fileFormat
+            value_label: metric
+            values: [events, totalFiles, overdueMins]
+            query: |
+              SELECT FILE_FORMAT AS "fileFormat", SUM(WR_REC_QUANTITY) AS events, 
+                     COUNT(FILE_NAME) AS "totalFiles",
+                     COALESCE(ROUND(EXTRACT(EPOCH FROM (NOW() - MIN(A.SYS_CREATION_DATE)))/60), 0) AS "overdueMins"
+              FROM AC1_CONTROL A
+              WHERE NXT_PGM_NAME = 'File2E'
+              AND FILE_FORMAT LIKE 'RERUN%'
+              AND FILE_STATUS IN ('RD','IU','AF','WA','HO','AE')
+              GROUP BY FILE_FORMAT
+
+# Resource limits
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Pod labels
+podLabels:
+  app: sql-exporter
+  version: "0.19.1"
+
+# Service account configuration uses defaults from values.yaml
+

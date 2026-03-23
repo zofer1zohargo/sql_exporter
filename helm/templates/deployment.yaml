@@ -191,7 +191,7 @@ spec:
             {{- end }}
             {{- end }}
           {{ if not .Values.overrideLivenessProbe }}
-          {{- /* Auto-generate probe: tcpSocket if basic auth enabled, httpGet otherwise */ -}}
+          {{- /* Liveness probe: always available on /healthz on main server */ -}}
           livenessProbe:
             {{- if and .Values.webConfig.enabled .Values.webConfig.basicAuth.enabled }}
             tcpSocket:
@@ -212,18 +212,14 @@ spec:
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           {{- end }}
-          {{ if not .Values.overrideReadinessProbe }}
-          {{- /* Auto-generate probe: tcpSocket if basic auth enabled, httpGet otherwise */ -}}
+          {{- if and .Values.webConfig.enabled .Values.webConfig.tls.secretName }}
+          {{- if not .Values.overrideReadinessProbe }}
+          {{- /* Readiness probe: only when TLS is enabled, points to health proxy on port 8080 */ -}}
           readinessProbe:
-            {{- if and .Values.webConfig.enabled .Values.webConfig.basicAuth.enabled }}
-            tcpSocket:
-              port: 9399
-            {{- else }}
             httpGet:
-              path: /healthz
-              port: 9399
-              scheme: {{ if and .Values.webConfig.enabled .Values.webConfig.tls.secretName }}HTTPS{{ else }}HTTP{{ end }}
-            {{- end }}
+              path: /ready
+              port: 8080
+              scheme: HTTP
             initialDelaySeconds: {{ if .Values.readinessProbe }}{{ .Values.readinessProbe.initialDelaySeconds | default 10 }}{{ else }}10{{ end }}
             timeoutSeconds: {{ if .Values.readinessProbe }}{{ .Values.readinessProbe.timeoutSeconds | default 5 }}{{ else }}5{{ end }}
             periodSeconds: {{ if .Values.readinessProbe }}{{ .Values.readinessProbe.periodSeconds | default 10 }}{{ else }}10{{ end }}
@@ -234,10 +230,16 @@ spec:
           readinessProbe:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
           {{- end }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 9399
               protocol: TCP
+            {{- if and .Values.webConfig.enabled .Values.webConfig.tls.secretName }}
+            - name: health-probe
+              containerPort: 8080
+              protocol: TCP
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
         {{- with .Values.extraContainers }}

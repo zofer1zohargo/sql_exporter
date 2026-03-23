@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,7 +28,8 @@ import (
 const (
 	appName string = "sql_exporter"
 
-	httpReadHeaderTimeout time.Duration = time.Duration(time.Second * 60)
+	httpReadHeaderTimeout   time.Duration = time.Duration(time.Second * 60)
+	healthProbeListenPort   string        = ":8080" // Plain HTTP health probe server when TLS is enabled
 )
 
 var (
@@ -100,7 +104,7 @@ func main() {
 
 	slog.Warn("Starting SQL exporter", "versionInfo", version.Info(), "buildContext",
 		version.BuildContext())
-	exporter, err := sql_exporter.NewExporter(*configFile, sql_exporter.SvcRegistry)
+	exporter, err := sql_exporter.NewExporter(*configFile)
 	if err != nil {
 		slog.Error("Error creating exporter", "error", err)
 		os.Exit(1)
@@ -123,7 +127,8 @@ func main() {
 	}
 
 	// Setup and start webserver.
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "OK", http.StatusOK) })
+	// Liveness: no DB connection, no TLS, no log noise. Use for liveness probes.
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	http.HandleFunc("/", HomeHandlerFunc(*metricsPath))
 	http.HandleFunc("/config", ConfigHandlerFunc(*metricsPath, exporter))
 	http.Handle(*metricsPath, metricsHandler)
@@ -135,6 +140,28 @@ func main() {
 		http.HandleFunc("/reload", reloadHandler(exporter, *configFile))
 	}
 
+	// Health probe server: only when TLS is enabled
+	// Provides plain HTTP /healthz and /ready endpoints on a separate port to avoid TLS handshake issues with K8s probes
+	if *webConfigFile != "" {
+		_, port, err := net.SplitHostPort(*listenAddress)
+		if err != nil {
+			slog.Error("Cannot derive main port for health probe server", "web.listen-address", *listenAddress, "error", err)
+			os.Exit(1)
+		}
+		targetURL := "https://127.0.0.1:" + port
+		proxy := newHealthProxy(targetURL, true) // always skip TLS verification (internal proxy)
+		healthMux := http.NewServeMux()
+		healthMux.HandleFunc("/healthz", proxy.serve)
+		healthMux.HandleFunc("/ready", proxy.serve)
+		healthServer := &http.Server{Addr: healthProbeListenPort, Handler: healthMux, ReadHeaderTimeout: httpReadHeaderTimeout}
+		go func() {
+			if err := healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("Health probe server error", "error", err)
+			}
+		}()
+		slog.Info("Health probe server listening (plain HTTP, proxies to main)", "address", healthProbeListenPort, "target", targetURL)
+	}
+
 	server := &http.Server{Addr: *listenAddress, ReadHeaderTimeout: httpReadHeaderTimeout}
 	if err := web.ListenAndServe(server, &web.FlagConfig{
 		WebListenAddresses: &([]string{*listenAddress}),
@@ -143,6 +170,56 @@ func main() {
 		slog.Error("Error starting web server", "error", err)
 		os.Exit(1)
 
+	}
+}
+
+const (
+	healthProxyTimeout = 5 * time.Second
+)
+
+// healthProxy forwards /healthz and /ready to the main server over HTTPS.
+type healthProxy struct {
+	client  *http.Client
+	baseURL string
+}
+
+func newHealthProxy(targetBaseURL string, insecureSkipVerify bool) *healthProxy {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkipVerify},
+	}
+	return &healthProxy{
+		client:  &http.Client{Timeout: healthProxyTimeout, Transport: transport},
+		baseURL: targetBaseURL,
+	}
+}
+
+func (p *healthProxy) serve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	targetURL := p.baseURL + r.URL.Path
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
+	if err != nil {
+		slog.Error("Health proxy request build failed", "url", targetURL, "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		slog.Error("Health proxy request failed", "url", targetURL, "error", err)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if resp.Body != nil && r.Method != http.MethodHead {
+		_, _ = io.Copy(w, resp.Body)
 	}
 }
 
