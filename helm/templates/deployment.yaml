@@ -220,7 +220,7 @@ spec:
               port: 9399
             {{- else }}
             httpGet:
-              path: /healthz
+              path: /ready
               port: 9399
               scheme: {{ if and .Values.webConfig.enabled .Values.webConfig.tls.secretName }}HTTPS{{ else }}HTTP{{ end }}
             {{- end }}

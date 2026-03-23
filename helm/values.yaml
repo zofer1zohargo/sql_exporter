@@ -114,7 +114,7 @@ serviceAccount:
 # overrideReadinessProbe: true
 # readinessProbe:
 #   httpGet:
-#     path: /healthz
+#     path: /ready
 #     port: 9399
 #     scheme: HTTP
 #   initialDelaySeconds: 10

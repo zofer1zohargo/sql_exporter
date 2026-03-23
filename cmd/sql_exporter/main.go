@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,9 +37,12 @@ var (
 	listenAddress = flag.String("web.listen-address", ":9399", "Address to listen on for web interface and telemetry")
 	metricsPath   = flag.String("web.metrics-path", "/metrics", "Path under which to expose metrics")
 	enableReload  = flag.Bool("web.enable-reload", false, "Enable reload collector data handler")
-	webConfigFile = flag.String("web.config.file", "", "[EXPERIMENTAL] TLS/BasicAuth configuration file path")
-	configFile    = flag.String("config.file", "sql_exporter.yml", "SQL Exporter configuration file path")
-	configCheck   = flag.Bool("config.check", false, "Check configuration and exit")
+	webConfigFile           = flag.String("web.config.file", "", "[EXPERIMENTAL] TLS/BasicAuth configuration file path")
+	webHealthListenAddress  = flag.String("web.health.listen-address", "", "When main server uses TLS (web.config.file set), listen here for plain HTTP and proxy to main server /healthz and /ready. K8s probes hit this to avoid TLS handshake errors. Ignored if web.config.file is not set.")
+	webHealthTargetURL      = flag.String("web.health.target-url", "", "Main server URL for health proxy (e.g. https://127.0.0.1:9399). Default: https://127.0.0.1:<port> from web.listen-address.")
+	webHealthInsecureVerify = flag.Bool("web.health.insecure-skip-verify", true, "Skip TLS verification when health proxy calls the main server. Set false to verify the main server certificate.")
+	configFile       = flag.String("config.file", "sql_exporter.yml", "SQL Exporter configuration file path")
+	configCheck      = flag.Bool("config.check", false, "Check configuration and exit")
 	logFormat     = flag.String("log.format", "logfmt", "Set log output format")
 	logLevel      = flag.String("log.level", "info", "Set log level")
 	logFile       = flag.String("log.file", "", "Log file to write to, leave empty to write to stderr")
@@ -123,7 +130,10 @@ func main() {
 	}
 
 	// Setup and start webserver.
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "OK", http.StatusOK) })
+	// Liveness: no DB connection, no TLS, no log noise. Use for liveness probes.
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	// Readiness: always pings the first target; returns 503 on failure (no logging to avoid log spam).
+	http.HandleFunc("/ready", readyHandler(exporter))
 	http.HandleFunc("/", HomeHandlerFunc(*metricsPath))
 	http.HandleFunc("/config", ConfigHandlerFunc(*metricsPath, exporter))
 	http.Handle(*metricsPath, metricsHandler)
@@ -135,6 +145,31 @@ func main() {
 		http.HandleFunc("/reload", reloadHandler(exporter, *configFile))
 	}
 
+	// Health proxy server: only when main server uses TLS. Thin plain HTTP server that forwards /healthz and
+	// /ready to the main server over HTTPS, so K8s can probe without TLS handshake errors.
+	if *webConfigFile != "" && *webHealthListenAddress != "" {
+		targetURL := *webHealthTargetURL
+		if targetURL == "" {
+			_, port, err := net.SplitHostPort(*listenAddress)
+			if err != nil {
+				slog.Error("Cannot derive health target URL from listen address", "web.listen-address", *listenAddress, "error", err)
+				os.Exit(1)
+			}
+			targetURL = "https://127.0.0.1:" + port
+		}
+		proxy := newHealthProxy(targetURL, *webHealthInsecureVerify)
+		healthMux := http.NewServeMux()
+		healthMux.HandleFunc("/healthz", proxy.serve)
+		healthMux.HandleFunc("/ready", proxy.serve)
+		healthServer := &http.Server{Addr: *webHealthListenAddress, Handler: healthMux, ReadHeaderTimeout: httpReadHeaderTimeout}
+		go func() {
+			if err := healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("Health server error", "error", err)
+			}
+		}()
+		slog.Info("Health server listening (plain HTTP, proxies to main)", "address", *webHealthListenAddress, "target", targetURL)
+	}
+
 	server := &http.Server{Addr: *listenAddress, ReadHeaderTimeout: httpReadHeaderTimeout}
 	if err := web.ListenAndServe(server, &web.FlagConfig{
 		WebListenAddresses: &([]string{*listenAddress}),
@@ -143,6 +178,72 @@ func main() {
 		slog.Error("Error starting web server", "error", err)
 		os.Exit(1)
 
+	}
+}
+
+const (
+	readyTimeout     = 2 * time.Second
+	healthProxyTimeout = 5 * time.Second
+)
+
+// healthProxy forwards /healthz and /ready to the main server over HTTPS.
+type healthProxy struct {
+	client  *http.Client
+	baseURL string
+}
+
+func newHealthProxy(targetBaseURL string, insecureSkipVerify bool) *healthProxy {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkipVerify},
+	}
+	return &healthProxy{
+		client:  &http.Client{Timeout: healthProxyTimeout, Transport: transport},
+		baseURL: targetBaseURL,
+	}
+}
+
+func (p *healthProxy) serve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	targetURL := p.baseURL + r.URL.Path
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
+	if err != nil {
+		slog.Error("Health proxy request build failed", "url", targetURL, "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		slog.Error("Health proxy request failed", "url", targetURL, "error", err)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if resp.Body != nil && r.Method != http.MethodHead {
+		_, _ = io.Copy(w, resp.Body)
+	}
+}
+
+// readyHandler returns a handler for the /ready readiness probe. It pings all targets; returns 503 and logs which
+// targets failed when any are unreachable or misconfigured.
+func readyHandler(e sql_exporter.Exporter) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
+		defer cancel()
+		if err := e.CheckReady(ctx); err != nil {
+			slog.Warn("Readiness check failed: one or more targets unreachable or misconfigured", "error", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	}
 }
 

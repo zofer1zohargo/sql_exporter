@@ -410,6 +410,25 @@ To use TLS and/or Basic Authentication, you need to pass a configuration file us
 The format of the file is described in the
 [exporter-toolkit](https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md) repository.
 
+**Health proxy when using TLS:** If the main server uses TLS, Kubernetes (and similar) often probe with plain TCP or HTTP, which triggers TLS handshake errors in the logs. You can run a second, plain HTTP server that only proxies `/healthz` and `/ready` to the main server over HTTPS. This health server is **only** started when both `--web.config.file` and `--web.health.listen-address` are set:
+
+| Flag | Description |
+|------|-------------|
+| `--web.health.listen-address` | Address for the plain HTTP health proxy (e.g. `:9090`). Ignored if `--web.config.file` is not set. |
+| `--web.health.target-url` | Main server URL for the proxy (e.g. `https://127.0.0.1:9399`). Default: `https://127.0.0.1:<port>` derived from `--web.listen-address`. |
+| `--web.health.insecure-skip-verify` | Skip TLS verification when the proxy calls the main server (default: true). Set to false to verify the main server certificate. |
+
+Example: main server with TLS on `:9399`, health proxy on `:9090`; point Kubernetes liveness/readiness at port 9090:
+
+```bash
+./sql_exporter \
+  --web.listen-address=:9399 \
+  --web.config.file=/etc/web-config.yml \
+  --web.health.listen-address=:9090
+```
+
+In Kubernetes, use `httpGet` to the health port (e.g. `port: 9090`, `path: /healthz` for liveness and `path: /ready` for readiness). Non-TLS connections to the main port (`:9399`) are still logged as errors.
+
 </details>
 
 <details>
