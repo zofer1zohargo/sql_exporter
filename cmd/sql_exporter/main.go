@@ -29,7 +29,7 @@ const (
 	appName string = "sql_exporter"
 
 	httpReadHeaderTimeout time.Duration = time.Duration(time.Second * 60)
-	healthProbeListenPort string        = ":8080" // Plain HTTP health probe server when TLS is enabled
+	healthProbeListenPort string = ":8080" // Plain HTTP health probe server when TLS is enabled
 )
 
 var (
